@@ -49,8 +49,9 @@ import re
 import json
 import logging
 import time
-import subprocess
 import socket
+import threading
+import select
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -219,48 +220,134 @@ def load_proxies(count: int) -> list[str | None]:
     return lines[:count]
 
 
-# ─── socks5 带认证代理转发（gost）────────────────────────────────────────────
-_gost_procs: dict[str, tuple] = {}  # proxy_url -> (local_port, proc)
+# ─── socks5 带认证代理转发（纯 Python asyncio HTTP 代理）────────────────────
+_tunnel_servers: dict[str, tuple] = {}  # proxy_url -> (local_port, server, thread)
 
 def _free_port() -> int:
-    """找一个可用的本地端口"""
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
-def start_gost_tunnel(proxy_url: str) -> str:
+def _parse_socks5_url(proxy_url: str):
+    """解析 socks5://user:pass@host:port"""
+    m = re.match(r'socks5://(?:([^:@]+):([^@]+)@)?([^:]+):(\d+)', proxy_url)
+    if not m:
+        raise ValueError(f"无法解析 socks5 URL: {proxy_url}")
+    username, password, host, port = m.groups()
+    return username, password, host, int(port)
+
+def _run_http_proxy(local_port: int, socks5_url: str, stop_event):
     """
-    对 socks5://user:pass@host:port 代理，用 gost 在本地起一个无认证 http 代理。
-    返回本地 http 代理 URL，如 http://127.0.0.1:XXXXX
-    已启动过的代理直接复用（缓存）。
+    在线程里运行一个简单的 HTTP CONNECT 代理，将请求转发到 socks5。
+    使用 python-socks 库连接 socks5（支持认证）。
     """
-    if proxy_url in _gost_procs:
-        port, proc = _gost_procs[proxy_url]
-        if proc.poll() is None:  # 进程还活着
+    try:
+        from python_socks.sync import Socks5Proxy
+    except ImportError:
+        from python_socks import Socks5Proxy
+
+    username, password, socks_host, socks_port = _parse_socks5_url(socks5_url)
+
+    def handle_client(conn: socket.socket):
+        try:
+            data = conn.recv(4096)
+            if not data:
+                return
+            first_line = data.split(b'\r\n')[0].decode()
+            parts = first_line.split()
+            if len(parts) < 2:
+                return
+            method, target = parts[0], parts[1]
+
+            if method == 'CONNECT':
+                # HTTPS 隧道
+                host, port = target.rsplit(':', 1)
+                port = int(port)
+            else:
+                # HTTP 直连
+                from urllib.parse import urlparse
+                parsed = urlparse(target)
+                host = parsed.hostname
+                port = parsed.port or 80
+
+            # 通过 socks5 连接目标
+            proxy = Socks5Proxy(
+                proxy_host=socks_host, proxy_port=socks_port,
+                username=username, password=password, rdns=True,
+            )
+            remote = proxy.connect(dest_host=host, dest_port=port)
+
+            if method == 'CONNECT':
+                conn.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
+            else:
+                remote.sendall(data)
+
+            # 双向转发
+            def forward(src, dst):
+                try:
+                    while True:
+                        r, _, _ = select.select([src], [], [], 5)
+                        if not r:
+                            break
+                        chunk = src.recv(8192)
+                        if not chunk:
+                            break
+                        dst.sendall(chunk)
+                except Exception:
+                    pass
+                finally:
+                    try: src.close()
+                    except: pass
+                    try: dst.close()
+                    except: pass
+
+            t = threading.Thread(target=forward, args=(remote, conn), daemon=True)
+            t.start()
+            forward(conn, remote)
+        except Exception:
+            try: conn.close()
+            except: pass
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", local_port))
+    srv.listen(32)
+    srv.settimeout(1)
+    while not stop_event.is_set():
+        try:
+            conn, _ = srv.accept()
+            threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+        except socket.timeout:
+            continue
+        except Exception:
+            break
+    srv.close()
+
+def start_socks5_tunnel(proxy_url: str) -> str:
+    """对 socks5://user:pass@host:port，在本地起 HTTP 代理转发，返回 http://127.0.0.1:PORT"""
+    if proxy_url in _tunnel_servers:
+        port, stop_event, t = _tunnel_servers[proxy_url]
+        if t.is_alive():
             return f"http://127.0.0.1:{port}"
         else:
-            del _gost_procs[proxy_url]
+            del _tunnel_servers[proxy_url]
 
     port = _free_port()
-    cmd = [
-        "gost",
-        "-L", f"http://127.0.0.1:{port}",
-        "-F", proxy_url,
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.8)  # 等 gost 启动
-    _gost_procs[proxy_url] = (port, proc)
-    log.info(f"  [gost] socks5 转发 -> http://127.0.0.1:{port}")
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=_run_http_proxy, args=(port, proxy_url, stop_event), daemon=True
+    )
+    t.start()
+    time.sleep(0.3)
+    log.info(f"  [proxy] socks5 -> http://127.0.0.1:{port}")
+    _tunnel_servers[proxy_url] = (port, stop_event, t)
     return f"http://127.0.0.1:{port}"
 
-def stop_all_gost():
-    """脚本结束时关闭所有 gost 进程"""
-    for url, (port, proc) in _gost_procs.items():
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-    _gost_procs.clear()
+def stop_all_tunnels():
+    """停止所有本地代理线程"""
+    for url, (port, stop_event, t) in _tunnel_servers.items():
+        stop_event.set()
+    _tunnel_servers.clear()
 
 
 def parse_proxy(proxy_url: str) -> dict:
@@ -280,9 +367,9 @@ def parse_proxy(proxy_url: str) -> dict:
 
     scheme, username, password, hostport = m.groups()
 
-    # socks5 带认证：Chromium 不支持，用 gost 本地转发
+    # socks5 带认证：Chromium 不支持，用纯 Python 本地 HTTP 代理转发
     if scheme == "socks5://" and username:
-        local_http = start_gost_tunnel(proxy_url)
+        local_http = start_socks5_tunnel(proxy_url)
         return {"server": local_http}
 
     result: dict = {"server": f"{scheme}{hostport}"}
@@ -1287,4 +1374,4 @@ if __name__ == "__main__":
         try:
             asyncio.run(main())
         finally:
-            stop_all_gost()
+            stop_all_tunnels()

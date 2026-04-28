@@ -2,14 +2,13 @@
 
 Arc Network 每日积分任务自动化脚本（多账号版）。脚本使用 Playwright 启动 Chromium，登录 `https://community.arc.network` 后依次完成内容阅读、视频观看、活动注册、论坛发帖和评论，并在本地保存账号状态与浏览器 session。
 
-> 使用前请确认你的操作符合 Arc Network、Gmail、代理服务等相关平台规则。本项目更适合作为 Playwright 自动化学习和个人任务管理示例，不建议用于滥用、多账号刷量或垃圾内容发布。
+> 使用前请确认你的操作符合 Arc Network、Gmail 等相关平台规则。本项目更适合作为 Playwright 自动化学习和个人任务管理示例，不建议用于滥用、多账号刷量或垃圾内容发布。
 
 ## 功能概览
 
 - 多账号串行执行，避免同时打开多个浏览器上下文。
 - 通过 Gmail IMAP 自动读取 Arc/Circle magic link 完成登录。
 - 登录成功后将 session 保存到 `sessions/`，后续运行优先复用。
-- 支持 HTTP、HTTPS、SOCKS5 代理；SOCKS5 带认证会自动转成本地 HTTP 代理供 Chromium 使用。
 - 自动执行每日任务：
   - 阅读 5 篇 Content 文章。
   - 观看 1 个 Content 视频。
@@ -26,12 +25,11 @@ arc_daily.py        主脚本
 requirements.txt   Python 依赖
 accounts.txt       Arc 登录邮箱列表，每行一个
 gmail_passes.txt   Gmail 应用专用密码，每行一个
-proxies.txt        代理列表，每行一个，可写 none
 sessions/          自动生成，保存各账号浏览器 session
 arc_state.json     自动生成，保存任务状态
 ```
 
-注意：`accounts.txt`、`gmail_passes.txt`、`proxies.txt` 按行一一对应。例如第 1 行邮箱使用第 1 行 Gmail 应用密码和第 1 行代理。
+注意：`accounts.txt`、`gmail_passes.txt` 按行一一对应。例如第 1 行邮箱使用第 1 行 Gmail 应用密码。
 
 ## 环境要求
 
@@ -96,20 +94,6 @@ abcd efgh ijkl mnop
 wxyz abcd efgh ijkl
 ```
 
-### `proxies.txt`
-
-每行填写一个代理，与 `accounts.txt` 同行对应。支持：
-
-```text
-http://user:pass@host:port
-https://user:pass@host:port
-socks5://user:pass@host:port
-http://host:port
-none
-```
-
-如果 `proxies.txt` 不存在，脚本会全部直连；如果代理行数少于账号数，缺少的账号也会直连。直连可能增加账号风控风险。
-
 ## 运行
 
 首次部署检查：
@@ -128,7 +112,7 @@ python arc_daily.py
 
 ## 执行流程
 
-1. 读取 `accounts.txt`、`gmail_passes.txt`、`proxies.txt`。
+1. 读取 `accounts.txt`、`gmail_passes.txt`。
 2. 启动一个无头 Chromium 浏览器。
 3. 对每个账号依次执行：
    - 尝试加载 `sessions/<邮箱前缀>.json`。
@@ -207,15 +191,7 @@ python D:\path\to\arc_daily.py
 - 应用专用密码是否正确，不是普通登录密码。
 - 邮件是否进入垃圾邮件或其他分类。
 - Arc/Circle 邮件是否延迟到达。
-- 代理网络是否影响登录页面提交。
-
-### SOCKS5 代理不能用
-
-脚本会把带认证的 `socks5://user:pass@host:port` 转成本地 HTTP 代理。请确认已安装 `python-socks`：
-
-```bash
-pip install -r requirements.txt
-```
+- 当前网络是否影响登录页面提交。
 
 ### 积分显示为 `N/A`
 
@@ -231,7 +207,6 @@ pip install -r requirements.txt
 ```gitignore
 gmail_passes.txt
 accounts.txt
-proxies.txt
 sessions/
 arc_state.json
 login_result_*.png
@@ -242,5 +217,4 @@ login_result_*.png
 
 ```text
 playwright>=1.40.0
-python-socks>=2.0.0
 ```

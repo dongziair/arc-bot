@@ -8,23 +8,14 @@ Arc Network 每日积分自动化脚本（多账号版）
   5. Discussions 评论 2 条帖子 +10 分
 
 账号配置文件 accounts.txt（与本脚本同目录），每行一个账号：
-  格式：邮箱----应用专用密码
   示例：
-    alice@gmail.com----abcd efgh ijkl mnop
-    bob@gmail.com----wxyz abcd efgh ijkl
+    alice@gmail.com
+    bob@gmail.com
 
-代理配置文件 proxies.txt（与本脚本同目录），每行一个代理，与账号按行对应：
-  支持格式：
-    http://user:pass@host:port
-    socks5://user:pass@host:port
-    http://host:port            （无认证）
+Gmail 应用专用密码配置文件 gmail_passes.txt（与本脚本同目录），每行一个：
   示例：
-    http://user1:pass1@1.2.3.4:8080
-    socks5://user2:pass2@5.6.7.8:1080
-    http://9.10.11.12:3128
-  注意：
-    - 行数必须与 accounts.txt 一致（一一对应）
-    - 如果某行写 none 或留空，该账号不使用代理（不推荐）
+    abcd efgh ijkl mnop
+    wxyz abcd efgh ijkl
 
 Gmail 准备步骤（每个账号）：
   1. Google 账户 → 安全 → 两步验证（必须开启）
@@ -41,7 +32,6 @@ Gmail 准备步骤（每个账号）：
 
 import asyncio
 import sys
-import os
 import random
 import imaplib
 import email as email_lib
@@ -49,9 +39,6 @@ import re
 import json
 import logging
 import time
-import socket
-import threading
-import select
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -63,7 +50,6 @@ SCRIPT_DIR    = Path(__file__).parent
 LOG_DIR       = SCRIPT_DIR.parent / "security-reports"
 ACCOUNTS_FILE     = SCRIPT_DIR / "accounts.txt"
 GMAIL_PASSES_FILE = SCRIPT_DIR / "gmail_passes.txt"
-PROXIES_FILE      = SCRIPT_DIR / "proxies.txt"
 STATE_FILE    = SCRIPT_DIR / "arc_state.json"
 SESSIONS_DIR  = SCRIPT_DIR / "sessions"   # 存放各账号的浏览器 session
 
@@ -111,7 +97,6 @@ COMMENT_TEMPLATES = [
 class Account:
     email: str
     app_pass: str
-    proxy: str | None = None  # e.g. "http://user:pass@host:port" or "socks5://..."
 
 @dataclass
 class AccountResult:
@@ -152,7 +137,7 @@ def _read_lines(path: Path) -> list[str]:
 def load_accounts() -> list[Account]:
     if not ACCOUNTS_FILE.exists():
         ACCOUNTS_FILE.write_text(
-            "# Arc 登录邮箱列表，每行一个，与 gmail_passes.txt / proxies.txt 按行对应\n"
+            "# Arc 登录邮箱列表，每行一个，与 gmail_passes.txt 按行对应\n"
             "# 示例：\n"
             "# alice@gmail.com\n"
             "# bob@gmail.com\n",
@@ -196,201 +181,6 @@ def load_gmail_passes(count: int) -> list[str]:
 
     log.info(f"加载 {count} 条 Gmail 应用密码")
     return passes[:count]
-
-
-# ─── 代理文件读取 ─────────────────────────────────────────────────────────────
-def load_proxies(count: int) -> list[str | None]:
-    """读取 proxies.txt，返回与账号等长的代理列表。缺少行时报错退出。"""
-    if not PROXIES_FILE.exists():
-        log.warning(f"代理文件不存在，所有账号将直连。如需代理请创建 {PROXIES_FILE}")
-        return [None] * count
-
-    lines = []
-    for line in PROXIES_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        lines.append(None if line.lower() == "none" else line)
-
-    if len(lines) < count:
-        gap = count - len(lines)
-        log.warning(f"proxies.txt 只有 {len(lines)} 条代理，账号有 {count} 个，剩余 {gap} 个账号将直连。")
-        lines += [None] * gap
-
-    if len(lines) > count:
-        log.warning(f"proxies.txt 有 {len(lines)} 条，账号有 {count} 个，多余代理已忽略。")
-
-    # 校验格式
-    for i, proxy in enumerate(lines[:count], 1):
-        if proxy is None:
-            log.warning(f"proxies.txt 第{i}行为 none，账号 {i} 将不走代理（风险较高）。")
-            continue
-        if not re.match(r'^(http|https|socks5)://', proxy):
-            log.error(f"proxies.txt 第{i}行格式不正确（需以 http:// 或 socks5:// 开头）: {proxy}")
-            sys.exit(1)
-
-    log.info(f"加载 {count} 条代理")
-    return lines[:count]
-
-
-# ─── socks5 带认证代理转发（纯 Python asyncio HTTP 代理）────────────────────
-_tunnel_servers: dict[str, tuple] = {}  # proxy_url -> (local_port, server, thread)
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-def _parse_socks5_url(proxy_url: str):
-    """解析 socks5://user:pass@host:port"""
-    m = re.match(r'socks5://(?:([^:@]+):([^@]+)@)?([^:]+):(\d+)', proxy_url)
-    if not m:
-        raise ValueError(f"无法解析 socks5 URL: {proxy_url}")
-    username, password, host, port = m.groups()
-    return username, password, host, int(port)
-
-def _run_http_proxy(local_port: int, socks5_url: str, stop_event):
-    """
-    在线程里运行一个简单的 HTTP CONNECT 代理，将请求转发到 socks5。
-    使用 python-socks 库连接 socks5（支持认证）。
-    """
-    try:
-        from python_socks.sync import Socks5Proxy
-    except ImportError:
-        from python_socks import Socks5Proxy
-
-    username, password, socks_host, socks_port = _parse_socks5_url(socks5_url)
-
-    def handle_client(conn: socket.socket):
-        try:
-            data = conn.recv(4096)
-            if not data:
-                return
-            first_line = data.split(b'\r\n')[0].decode()
-            parts = first_line.split()
-            if len(parts) < 2:
-                return
-            method, target = parts[0], parts[1]
-
-            if method == 'CONNECT':
-                # HTTPS 隧道
-                host, port = target.rsplit(':', 1)
-                port = int(port)
-            else:
-                # HTTP 直连
-                from urllib.parse import urlparse
-                parsed = urlparse(target)
-                host = parsed.hostname
-                port = parsed.port or 80
-
-            # 通过 socks5 连接目标
-            proxy = Socks5Proxy(
-                proxy_host=socks_host, proxy_port=socks_port,
-                username=username, password=password, rdns=True,
-            )
-            remote = proxy.connect(dest_host=host, dest_port=port)
-
-            if method == 'CONNECT':
-                conn.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
-            else:
-                remote.sendall(data)
-
-            # 双向转发
-            def forward(src, dst):
-                try:
-                    while True:
-                        r, _, _ = select.select([src], [], [], 5)
-                        if not r:
-                            break
-                        chunk = src.recv(8192)
-                        if not chunk:
-                            break
-                        dst.sendall(chunk)
-                except Exception:
-                    pass
-                finally:
-                    try: src.close()
-                    except: pass
-                    try: dst.close()
-                    except: pass
-
-            t = threading.Thread(target=forward, args=(remote, conn), daemon=True)
-            t.start()
-            forward(conn, remote)
-        except Exception:
-            try: conn.close()
-            except: pass
-
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", local_port))
-    srv.listen(32)
-    srv.settimeout(1)
-    while not stop_event.is_set():
-        try:
-            conn, _ = srv.accept()
-            threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
-        except socket.timeout:
-            continue
-        except Exception:
-            break
-    srv.close()
-
-def start_socks5_tunnel(proxy_url: str) -> str:
-    """对 socks5://user:pass@host:port，在本地起 HTTP 代理转发，返回 http://127.0.0.1:PORT"""
-    if proxy_url in _tunnel_servers:
-        port, stop_event, t = _tunnel_servers[proxy_url]
-        if t.is_alive():
-            return f"http://127.0.0.1:{port}"
-        else:
-            del _tunnel_servers[proxy_url]
-
-    port = _free_port()
-    stop_event = threading.Event()
-    t = threading.Thread(
-        target=_run_http_proxy, args=(port, proxy_url, stop_event), daemon=True
-    )
-    t.start()
-    time.sleep(0.3)
-    log.info(f"  [proxy] socks5 -> http://127.0.0.1:{port}")
-    _tunnel_servers[proxy_url] = (port, stop_event, t)
-    return f"http://127.0.0.1:{port}"
-
-def stop_all_tunnels():
-    """停止所有本地代理线程"""
-    for url, (port, stop_event, t) in _tunnel_servers.items():
-        stop_event.set()
-    _tunnel_servers.clear()
-
-
-def parse_proxy(proxy_url: str) -> dict:
-    """
-    将代理 URL 解析为 Playwright context 所需的 proxy dict。
-    Playwright 格式：{"server": "...", "username": "...", "password": "***"}
-
-    注意：Playwright Chromium 不支持 socks5 带认证。
-    对于 socks5://user:pass@host:port，自动用 gost 转成本地无认证 http 代理。
-    """
-    m = re.match(
-        r'^((?:http|https|socks5)://)(?:([^:@]+):([^@]+)@)?(.+)$',
-        proxy_url,
-    )
-    if not m:
-        return {"server": proxy_url}
-
-    scheme, username, password, hostport = m.groups()
-
-    # socks5 带认证：Chromium 不支持，用纯 Python 本地 HTTP 代理转发
-    if scheme == "socks5://" and username:
-        local_http = start_socks5_tunnel(proxy_url)
-        return {"server": local_http}
-
-    result: dict = {"server": f"{scheme}{hostport}"}
-    if username:
-        result["username"] = username
-    if password:
-        result["password"] = password
-    return result
 
 
 # ─── 全局状态（记录已注册活动，按邮箱区分）────────────────────────────────────
@@ -1091,10 +881,6 @@ async def run_account(account: Account, browser: Browser, state: dict) -> Accoun
         ),
         locale="en-US",
     )
-    if account.proxy:
-        ctx_kwargs["proxy"] = parse_proxy(account.proxy)
-        log.info(f"[{account.email}] 使用代理: {account.proxy.split('@')[-1]}")
-
     # 如果有保存的 session，先尝试直接加载
     session_ok = False
     if session_file.exists():
@@ -1240,10 +1026,8 @@ async def run_once():
 
     accounts = load_accounts()
     passes   = load_gmail_passes(len(accounts))
-    proxies  = load_proxies(len(accounts))
-    for account, app_pass, proxy in zip(accounts, passes, proxies):
+    for account, app_pass in zip(accounts, passes):
         account.app_pass = app_pass
-        account.proxy    = proxy
 
     state   = load_state()
     results = []
@@ -1338,7 +1122,6 @@ def setup():
     for fname, hint in [
         (ACCOUNTS_FILE,     "填写每行一个 Arc 登录邮箱"),
         (GMAIL_PASSES_FILE, "填写每行一个 Gmail 应用专用密码（与邮箱行对应）"),
-        (PROXIES_FILE,      "填写每行一个代理（与邮箱行对应）"),
     ]:
         if not fname.exists() or all(
             l.strip().startswith("#") or not l.strip()
@@ -1384,7 +1167,4 @@ if __name__ == "__main__":
     if "--setup" in sys.argv:
         setup()
     else:
-        try:
-            asyncio.run(main())
-        finally:
-            stop_all_tunnels()
+        asyncio.run(main())

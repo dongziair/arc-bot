@@ -42,7 +42,7 @@ import time
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
-from playwright.async_api import async_playwright, Page, BrowserContext, Browser
+from playwright.async_api import async_playwright, Page, BrowserContext, Browser, TimeoutError as PlaywrightTimeoutError
 
 # ─── 常量 ────────────────────────────────────────────────────────────────────
 BASE_URL      = "https://community.arc.network"
@@ -179,8 +179,17 @@ def load_gmail_passes(count: int) -> list[str]:
     if len(passes) > count:
         log.warning(f"gmail_passes.txt 有 {len(passes)} 条，多于账号数 {count}，多余行已忽略。")
 
+    normalized_passes = []
+    for i, app_pass in enumerate(passes[:count], 1):
+        normalized = re.sub(r"\s+", "", app_pass)
+        if normalized != app_pass:
+            log.info(f"gmail_passes.txt 第{i}行已自动去除空格")
+        if len(normalized) != 16:
+            log.warning(f"gmail_passes.txt 第{i}行长度不是 16 位，请确认是否为 Gmail 应用专用密码")
+        normalized_passes.append(normalized)
+
     log.info(f"加载 {count} 条 Gmail 应用密码")
-    return passes[:count]
+    return normalized_passes
 
 
 # ─── 全局状态（记录已注册活动，按邮箱区分）────────────────────────────────────
@@ -212,6 +221,51 @@ async def scroll_slowly(page: Page, steps: int = 5):
     for _ in range(steps):
         await page.mouse.wheel(0, random.randint(200, 500))
         await asyncio.sleep(random.uniform(0.4, 0.9))
+
+
+async def dismiss_cookie_banner(page: Page, email: str | None = None) -> bool:
+    """关闭常见 Cookie / 隐私弹窗，避免遮罩层挡住表单按钮。"""
+    prefix = f"[{email}] " if email else ""
+    selectors = [
+        "#onetrust-accept-btn-handler",
+        "#onetrust-reject-all-handler",
+        "#accept-recommended-btn-handler",
+        "button:has-text('Accept All')",
+        "button:has-text('Accept all')",
+        "button:has-text('Accept Cookies')",
+        "button:has-text('I Accept')",
+        "button:has-text('Allow all')",
+        "button:has-text('Reject All')",
+        "button:has-text('Reject all')",
+        "button:has-text('Save Choices')",
+        "button:has-text('Save choices')",
+        "#close-pc-btn-handler",
+        ".ot-close-icon",
+        "button[aria-label='Close']",
+    ]
+
+    for sel in selectors:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=1500):
+                await btn.click(timeout=5000)
+                log.info(f"{prefix}已处理 Cookie/隐私弹窗: {sel}")
+                await asyncio.sleep(1)
+                return True
+        except Exception:
+            continue
+
+    try:
+        overlay = page.locator("#onetrust-consent-sdk, .onetrust-pc-dark-filter").first
+        if await overlay.is_visible(timeout=1000):
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+            log.info(f"{prefix}尝试通过 Escape 关闭 Cookie/隐私弹窗")
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 # ─── IMAP：从 Gmail 取 Magic Link ─────────────────────────────────────────────
@@ -277,6 +331,15 @@ def fetch_magic_link(email: str, app_pass: str, timeout_sec: int = 90) -> str | 
 
             mail.logout()
 
+        except imaplib.IMAP4.error as e:
+            message = str(e)
+            if "AUTHENTICATIONFAILED" in message.upper() or "INVALID CREDENTIALS" in message.upper():
+                log.error(
+                    f"[{email}] Gmail IMAP 认证失败：请检查 gmail_passes.txt 中该账号对应行的应用专用密码、"
+                    "Gmail 两步验证和 IMAP 是否已开启。"
+                )
+                return None
+            log.warning(f"[{email}] IMAP 读取失败: {e}")
         except Exception as e:
             log.warning(f"[{email}] IMAP 读取失败: {e}")
 
@@ -384,6 +447,7 @@ async def login(page: Page, account: Account) -> bool:
     log.info(f"[{account.email}] 开始登录（Magic Link）...")
     await page.goto(f"{BASE_URL}/home/sign_in", wait_until="domcontentloaded", timeout=60000)
     await human_delay(3, 5)
+    await dismiss_cookie_banner(page, account.email)
 
     email_input = page.locator(
         "input[type='email'], input[name='email'], input[placeholder*='email' i]"
@@ -391,12 +455,18 @@ async def login(page: Page, account: Account) -> bool:
     await email_input.wait_for(state="visible", timeout=60000)
     await email_input.fill(account.email)
     await human_delay(0.8, 1.5)
+    await dismiss_cookie_banner(page, account.email)
 
     submit = page.locator(
         "button[type='submit'], button:has-text('Sign in'), "
         "button:has-text('Log in'), button:has-text('Continue'), button:has-text('Send')"
     ).first
-    await submit.click()
+    try:
+        await submit.click()
+    except PlaywrightTimeoutError:
+        log.warning(f"[{account.email}] 登录按钮被弹窗或遮罩挡住，处理后重试...")
+        await dismiss_cookie_banner(page, account.email)
+        await submit.click(timeout=10000)
     log.info(f"[{account.email}] 已提交邮箱，等待确认邮件...")
     await human_delay(3, 5)
 

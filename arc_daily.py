@@ -80,6 +80,19 @@ POST_TEMPLATES = [
     "How are developers handling cross-chain UX challenges when building on Arc? Would love to compare approaches.",
     "Are there any Arc community projects looking for contributors? Happy to help with testing or docs.",
     "What's your take on the role of stablecoins in DeFi liquidity? Curious how Arc builders are thinking about this.",
+    "Just starting out with Arc. What frontend framework are you guys pairing with the App Kits? React feels like the obvious choice, but curious if anyone is trying something else.",
+    "Hey folks, besides the official docs, are there any good GitHub repos or boilerplates you'd recommend for a newcomer trying to build a basic dApp here?",
+    "Stuck on a minor thing: what's the standard practice for handling RPC issues here? Are most of you using dedicated nodes or just dealing with public endpoints?",
+    
+    # 新增：闲聊与行业趋势探讨（带点主观色彩）
+    "Gm everyone. Random question, but what's the one feature you wish the Arc ecosystem had right now? For me, it's probably better indexing tools.",
+    "Been looking at the recent stablecoin volumes. Do you guys think the growth is mostly driven by yield farming or actual cross-border payments? Tbh, I'm leaning towards the latter.",
+    "Seeing a lot of new projects popping up lately. Which one caught your eye this week? Need something interesting to read up on this weekend.",
+    
+    # 新增：开发日常吐槽/分享
+    "Anyone else notice the UI update on the dashboard recently? Looks much cleaner imo.",
+    "Finally got my first smart contract deployed on testnet today! The docs were surprisingly helpful, but I definitely spent too much time debugging silly errors.",
+    "What's everyone using for wallet connections these days? The UX still feels a bit clunky for non-crypto natives tbh."
 ]
 
 COMMENT_TEMPLATES = [
